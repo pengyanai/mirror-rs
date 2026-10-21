@@ -290,9 +290,6 @@ pub async fn probe_all(
     timeout_ms: u64,
 ) -> Vec<ProbeResult> {
     let futs = mirrors.iter().map(|m| {
-        let client = client;
-        let probe_bytes = probe_bytes;
-        let timeout_ms = timeout_ms;
         async move { probe_mirror(client, m, probe_bytes, timeout_ms).await }
     });
     let mut results = futures_util::future::join_all(futs).await;

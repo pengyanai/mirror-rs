@@ -120,6 +120,7 @@ impl Config {
     }
 
     /// Write the config to disk (pretty JSON).
+    #[allow(dead_code)]
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -144,6 +145,7 @@ impl Config {
     }
 
     /// Resolve the mirror-rs config path (default ~/.config/mirror-rs/config.json).
+    #[allow(dead_code)]
     pub fn resolved_config_path(&self) -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))

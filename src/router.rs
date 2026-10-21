@@ -73,6 +73,7 @@ impl Router {
     }
 
     /// Get the current best mirror index (0 if none).
+    #[allow(dead_code)]
     pub async fn best_index(&self) -> usize {
         self.order.read().await.first().copied().unwrap_or(0)
     }

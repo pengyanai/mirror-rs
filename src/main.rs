@@ -51,7 +51,7 @@ enum Command {
     Init,
 }
 
-fn expand_home(p: &PathBuf) -> PathBuf {
+fn expand_home(p: &std::path::Path) -> PathBuf {
     if let Some(s) = p.to_str().and_then(|s| s.strip_prefix('~')) {
         if let Some(home) = dirs::home_dir() {
             // s may start with '/' (e.g. "/.config/...") — join would replace
@@ -60,7 +60,7 @@ fn expand_home(p: &PathBuf) -> PathBuf {
             return home.join(rel);
         }
     }
-    p.clone()
+    p.to_path_buf()
 }
 
 #[tokio::main]
@@ -224,7 +224,7 @@ async fn setup(cfg: &Config, do_restart: bool) -> anyhow::Result<()> {
     //    The URL must be the host IP as seen from the Docker daemon (inside the
     //    OrbStack VM), not 127.0.0.1 (which is the VM's own loopback).
     let proxy_url = format!("http://{}:{}", cfg.host_ip, cfg.port);
-    write_docker_config(&docker_cfg, &[proxy_url.clone()])?;
+    write_docker_config(&docker_cfg, std::slice::from_ref(&proxy_url))?;
 
     // 2. Install launchd service (macOS) so the proxy auto-starts.
     install_launchd(cfg, &proxy_url)?;
