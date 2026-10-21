@@ -289,9 +289,9 @@ pub async fn probe_all(
     probe_bytes: u64,
     timeout_ms: u64,
 ) -> Vec<ProbeResult> {
-    let futs = mirrors.iter().map(|m| {
-        async move { probe_mirror(client, m, probe_bytes, timeout_ms).await }
-    });
+    let futs = mirrors
+        .iter()
+        .map(|m| async move { probe_mirror(client, m, probe_bytes, timeout_ms).await });
     let mut results = futures_util::future::join_all(futs).await;
     results.sort_by(|a, b| {
         a.score()
