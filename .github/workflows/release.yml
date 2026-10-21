@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: aarch64-apple-darwin
+            cross: false
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: x86_64-apple-darwin
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            name: aarch64-unknown-linux-musl
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (native)
+        if: matrix.cross == false
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cross-rs/cross/master/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/mirror-rs
+          test -f "$BIN"
+          chmod +x "$BIN"
+          pkg="mirror-rs-${{ matrix.name }}"
+          tar -czf "${pkg}.tar.gz" -C target/${{ matrix.target }}/release mirror-rs
+          sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            mirror-rs-${{ matrix.name }}.tar.gz
+            mirror-rs-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.sha256
+          generate_release_notes: true
+
+  update-brew:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ secrets.TAP_TOKEN != '' }}
+    steps:
+      - name: Checkout mirror-rs (for script)
+        uses: actions/checkout@v4
+        with:
+          path: mirror-rs
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: pengyanai/homebrew-tap
+          path: tap
+          token: ${{ secrets.TAP_TOKEN }}
+
+      - name: Generate + commit formula
+        run: |
+          python3 mirror-rs/scripts/gen_brew_formula.py "" tap/Formula/mirror-rs.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/mirror-rs.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged"
+          else
+            git commit -m "mirror-rs: bump to latest release"
+            git push
+          fi

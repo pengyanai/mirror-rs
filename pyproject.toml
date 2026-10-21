@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirror-rs"
+version = "0.1.0"
+description = "Seamless, transparent Docker registry mirror proxy with speed-based load balancing"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "pengyanai" }]
+keywords = ["docker", "registry", "mirror", "proxy", "load-balancing"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: macOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: System :: Networking",
+]
+
+[project.scripts]
+mirror-rs = "mirror_rs:main"
+
+[project.urls]
+Homepage = "https://github.com/pengyanai/mirror-rs"
+Repository = "https://github.com/pengyanai/mirror-rs"
+
+[tool.setuptools]
+packages = ["mirror_rs"]
+
+[tool.setuptools.package-data]
+mirror_rs = ["bin/*"]
+
+[tool.setuptools.cmdclass]
+build_py = "build_backend:BuildPy"

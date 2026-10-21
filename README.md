@@ -50,14 +50,31 @@ daemon never needs to restart when speeds change — that's what makes it
 - **Safe config management** — backs up `docker.json` before editing, preserves
   other keys (e.g. `ipv6`), and `teardown` restores cleanly.
 
-## Build
+## Install
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install pengyanai/tap/mirror-rs
+```
+
+### pip (any platform with a prebuilt binary)
+
+```bash
+pip install git+https://github.com/pengyanai/mirror-rs
+```
+
+The wheel bundles the prebuilt binary for your platform (macOS arm64/x86_64,
+Linux x86_64/aarch64) — no Rust toolchain needed.
+
+### From source
 
 ```bash
 cargo build --release
 # binary: target/release/mirror-rs
 ```
 
-## Install (one-time)
+## Setup (one-time)
 
 ```bash
 # 1. (optional) edit config: mirrors, port, probe interval
