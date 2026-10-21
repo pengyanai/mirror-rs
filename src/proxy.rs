@@ -6,6 +6,319 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    struct Server {
+        url: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    async fn serve(app: axum::Router) -> Server {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Server { url, task }
+    }
+    fn mirror(server: &Server) -> Mirror {
+        Mirror {
+            url: server.url.clone(),
+            token: None,
+        }
+    }
+    fn app(mirrors: Vec<Mirror>) -> axum::Router {
+        build_router(AppState {
+            client: reqwest::Client::new(),
+            router: Router::new(mirrors),
+            tokens: crate::auth::TokenCache::default(),
+        })
+    }
+    async fn request(app: axum::Router, path: &str) -> Response {
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+    async fn bytes(resp: Response) -> Bytes {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+    async fn authenticated_upstream(
+        status: StatusCode,
+        expires_in: u64,
+    ) -> (Server, Arc<AtomicUsize>) {
+        let tokens = Arc::new(AtomicUsize::new(0));
+        let count = tokens.clone();
+        let upstream = serve(axum::Router::new()
+            .route("/token", axum::routing::get(move || { let count = count.clone(); async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                axum::Json(serde_json::json!({"token":"test-token", "expires_in":expires_in}))
+            }}))
+            .fallback(move |req: Request| async move {
+                if req.headers().get("authorization").is_some_and(|h| h == "Bearer test-token") {
+                    (status, "authenticated").into_response()
+                } else {
+                    let host = req.headers().get("host").unwrap().to_str().unwrap();
+                    (StatusCode::UNAUTHORIZED, [("www-authenticate", format!("Bearer realm=\"http://{host}/token\",service=\"registry\",scope=\"repository:library/alpine:pull\""))]).into_response()
+                }
+            })).await;
+        (upstream, tokens)
+    }
+
+    #[tokio::test]
+    async fn authenticated_retry_404_fails_over() {
+        let (upstream, _) = authenticated_upstream(StatusCode::NOT_FOUND, 60).await;
+        let backup = serve(axum::Router::new().fallback(|| async { "backup" })).await;
+        let response = request(
+            app(vec![mirror(&upstream), mirror(&backup)]),
+            "/v2/library/alpine/manifests/latest",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(bytes(response).await, "backup");
+    }
+
+    #[tokio::test]
+    async fn authenticated_retry_503_fails_over() {
+        let (upstream, _) = authenticated_upstream(StatusCode::SERVICE_UNAVAILABLE, 60).await;
+        let backup = serve(axum::Router::new().fallback(|| async { "backup" })).await;
+        let response = request(
+            app(vec![mirror(&upstream), mirror(&backup)]),
+            "/v2/library/alpine/manifests/latest",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(bytes(response).await, "backup");
+    }
+
+    #[tokio::test]
+    async fn concurrent_token_fetches_are_coalesced_and_cached_per_repository() {
+        let (upstream, tokens) = authenticated_upstream(StatusCode::OK, 60).await;
+        let app = app(vec![mirror(&upstream)]);
+        let responses = futures_util::future::join_all(
+            (0..12).map(|_| request(app.clone(), "/v2/library/alpine/manifests/latest")),
+        )
+        .await;
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            tokens.load(Ordering::SeqCst),
+            1,
+            "concurrent misses should fetch one token"
+        );
+        assert_eq!(
+            request(app.clone(), "/v2/library/alpine/blobs/sha256:abc")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            tokens.load(Ordering::SeqCst),
+            1,
+            "manifest and blob share repository token"
+        );
+        assert_eq!(
+            request(app, "/v2/other/repo/manifests/latest")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            tokens.load(Ordering::SeqCst),
+            2,
+            "another repository gets its own token"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_cache_honors_expiry() {
+        let (upstream, tokens) = authenticated_upstream(StatusCode::OK, 1).await;
+        let app = app(vec![mirror(&upstream)]);
+        for _ in 0..2 {
+            assert_eq!(
+                request(app.clone(), "/v2/library/alpine/manifests/latest")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(tokens.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            request(app, "/v2/library/alpine/manifests/latest")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(tokens.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn client_authorization_is_not_forwarded_to_mirror() {
+        let upstream = serve(axum::Router::new().fallback(|req: Request| async move {
+            assert!(
+                req.headers().get("authorization").is_none(),
+                "registry credential leaked"
+            );
+            "safe"
+        }))
+        .await;
+        let response = app(vec![mirror(&upstream)])
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/")
+                    .header("authorization", "Bearer registry-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn server_errors_cool_down_but_missing_resources_do_not() {
+        for status in [StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let count = hits.clone();
+            let primary = serve(axum::Router::new().fallback(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    status
+                }
+            }))
+            .await;
+            let backup = serve(axum::Router::new().fallback(|| async { "backup" })).await;
+            let app = app(vec![mirror(&primary), mirror(&backup)]);
+            for path in ["/v2/a/manifests/one", "/v2/a/manifests/two"] {
+                assert_eq!(request(app.clone(), path).await.status(), StatusCode::OK);
+            }
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                if status.is_server_error() { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_stream_survives_thirty_second_total_duration() {
+        use futures_util::StreamExt;
+        let upstream = serve(axum::Router::new().fallback(|| async {
+            Body::from_stream(futures_util::stream::unfold(0, |index| async move {
+                if index == 64 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Some((
+                    Ok::<_, std::io::Error>(Bytes::from(vec![index; 1024])),
+                    index + 1,
+                ))
+            }))
+        }))
+        .await;
+        let state = AppState {
+            client: crate::proxy_client().unwrap(),
+            router: Router::new(vec![mirror(&upstream)]),
+            tokens: crate::auth::TokenCache::default(),
+        };
+        let response = request(build_router(state), "/v2/a/blobs/sha256:abc").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut actual = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        let expected: Vec<u8> = (0..64).flat_map(|index| vec![index; 1024]).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn all_cooled_mirrors_remain_available_as_fallback() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let upstream = serve(axum::Router::new().fallback(move || {
+            let count = count.clone();
+            async move {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }))
+        .await;
+        let app = app(vec![mirror(&upstream)]);
+        assert_eq!(
+            request(app.clone(), "/v2/a/manifests/one").await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            request(app, "/v2/a/manifests/two").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_response_preserves_bytes_and_delivers_before_completion() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let chunk = Bytes::from(vec![0x9d; 1024 * 1024]);
+        let expected = chunk.clone();
+        let upstream = serve(axum::Router::new().fallback(move || {
+            let rx = rx.clone();
+            let chunk = chunk.clone();
+            async move {
+                let receiver = rx.lock().await.take().unwrap();
+                let stream =
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(chunk) })
+                        .chain(futures_util::stream::once(async move {
+                            receiver.await.unwrap();
+                            Ok(Bytes::from_static(b"tail\x00\xff"))
+                        }));
+                Body::from_stream(stream)
+            }
+        }))
+        .await;
+        use futures_util::StreamExt;
+        let response = request(app(vec![mirror(&upstream)]), "/v2/a/blobs/sha256:abc").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            let part = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            received.extend_from_slice(&part);
+        }
+        assert_eq!(&received, expected.as_ref());
+        tx.send(()).unwrap();
+        while let Some(part) = stream.next().await {
+            received.extend_from_slice(&part.unwrap());
+        }
+        let mut expected = expected.to_vec();
+        expected.extend_from_slice(b"tail\x00\xff");
+        assert_eq!(received, expected);
+    }
+}
+
 /// Hop-by-hop headers that must not be forwarded between client and upstream.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -22,6 +335,7 @@ const HOP_BY_HOP: &[&str] = &[
 pub struct AppState {
     pub client: reqwest::Client,
     pub router: Router,
+    pub tokens: crate::auth::TokenCache,
 }
 
 enum UpstreamError {
@@ -84,7 +398,8 @@ async fn status(State(state): State<AppState>) -> Response {
 
 async fn probe_now(State(state): State<AppState>) -> Response {
     let mirrors = state.router.mirrors.clone();
-    let results = crate::probe::probe_all(&state.client, &mirrors, 256 * 1024, 8000).await;
+    let results =
+        crate::probe::probe_all(&state.client, &state.tokens, &mirrors, 256 * 1024, 8000).await;
     state.router.update_from_probes(results.clone()).await;
     let payload: Vec<serde_json::Value> = results
         .iter()
@@ -119,8 +434,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     // Forwarded headers (strip hop-by-hop + host).
     let mut fwd = HeaderMap::new();
     for (k, v) in req.headers() {
-        let lk = k.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lk.as_str()) || lk == "host" {
+        if HOP_BY_HOP.contains(&k.as_str()) || k == "host" || k == "authorization" {
             continue;
         }
         fwd.append(k, v.clone());
@@ -140,7 +454,17 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     for mirror in &mirrors {
         let t0 = std::time::Instant::now();
-        match forward_once(&state.client, mirror, &method, &path_and_query, &fwd, &body).await {
+        match forward_once(
+            &state.client,
+            &state.tokens,
+            mirror,
+            &method,
+            &path_and_query,
+            &fwd,
+            &body,
+        )
+        .await
+        {
             Ok(resp) => {
                 tracing::info!(
                     mirror = %mirror.url,
@@ -154,6 +478,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
             Err(e) => {
                 if !e.is_404() {
                     all_404 = false;
+                }
+                if matches!(&e, UpstreamError::Conn(_) | UpstreamError::Http(500..=599)) {
+                    state.router.cool_down(mirror).await;
                 }
                 tracing::warn!(mirror = %mirror.url, err = %e.describe(), "upstream failed, failing over");
                 last_err = Some(e);
@@ -178,6 +505,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 /// Forward a single request to one mirror, handling the Docker token dance.
 async fn forward_once(
     client: &reqwest::Client,
+    tokens: &crate::auth::TokenCache,
     mirror: &Mirror,
     method: &Method,
     path_and_query: &str,
@@ -187,51 +515,54 @@ async fn forward_once(
     let base = mirror.url.trim_end_matches('/');
     let url = format!("{base}{path_and_query}");
 
-    let resp = send(client, mirror, method, &url, headers, body).await?;
-    let status = resp.status();
+    let key = crate::auth::TokenKey::new(base, path_and_query);
+    let cached = tokens.get(&key).await;
+    let token = cached.as_deref().or(mirror.token.as_deref());
+    let mut resp = send(client, method, &url, headers, body, token).await?;
 
-    // 401 => perform the registry token dance and retry once.
-    if status.as_u16() == 401 {
-        if let Some(wa) = resp
-            .headers()
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Some(token) = crate::probe::fetch_token(client, wa).await {
-                let mut h2 = headers.clone();
-                h2.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-                let resp2 = send(client, mirror, method, &url, &h2, body).await?;
-                return to_axum_response(resp2).await;
-            }
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        if let Some(rejected) = cached.as_deref() {
+            tokens.invalidate(&key, rejected).await;
         }
-        return Err(UpstreamError::Http(401));
+        let challenge = resp
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        drop(resp);
+        let token = tokens
+            .fetch(client, key, &challenge, std::time::Duration::from_secs(8))
+            .await
+            .map_err(|_| UpstreamError::Http(401))?;
+        resp = send(client, method, &url, headers, body, Some(&token)).await?;
     }
 
-    // 404 / 5xx => soft failure, let the caller try the next mirror.
-    if status.as_u16() == 404 || status.is_server_error() {
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 404) || status.is_server_error() {
         return Err(UpstreamError::Http(status.as_u16()));
     }
-
     to_axum_response(resp).await
 }
 
 async fn send(
     client: &reqwest::Client,
-    mirror: &Mirror,
     method: &Method,
     url: &str,
     headers: &HeaderMap,
     body: &Bytes,
+    token: Option<&str>,
 ) -> Result<reqwest::Response, UpstreamError> {
     let mut req = client.request(method.clone(), url);
     for (k, v) in headers {
         req = req.header(k, v);
     }
     if !body.is_empty() {
-        req = req.body(body.to_vec());
+        req = req.body(body.clone());
     }
-    if let Some(tok) = &mirror.token {
-        req = req.header("Authorization", format!("Bearer {tok}"));
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
     }
     req.send()
         .await
@@ -243,8 +574,7 @@ async fn to_axum_response(resp: reqwest::Response) -> Result<Response, UpstreamE
     let status = resp.status();
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        let lk = k.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lk.as_str()) {
+        if HOP_BY_HOP.contains(&k.as_str()) {
             continue;
         }
         builder = builder.header(k, v);

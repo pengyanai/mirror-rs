@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod daemon;
 mod probe;
@@ -87,9 +88,14 @@ async fn main() -> anyhow::Result<()> {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_millis(cfg.probe_timeout_ms))
                 .build()?;
-            let results =
-                probe::probe_all(&client, &cfg.mirrors, cfg.probe_bytes, cfg.probe_timeout_ms)
-                    .await;
+            let results = probe::probe_all(
+                &client,
+                &auth::TokenCache::default(),
+                &cfg.mirrors,
+                cfg.probe_bytes,
+                cfg.probe_timeout_ms,
+            )
+            .await;
             print_table(&results);
             Ok(())
         }
@@ -158,60 +164,58 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 async fn run_server(cfg: &Config) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(
-            cfg.probe_timeout_ms.max(30_000),
-        ))
-        .pool_max_idle_per_host(32)
-        .build()?;
+    let client = proxy_client()?;
 
     let router = router::Router::new(cfg.mirrors.clone());
+    let daemon = daemon::Daemon::new(client.clone(), router.clone(), cfg.clone());
     let state = proxy::AppState {
-        client: client.clone(),
-        router: router.clone(),
+        client,
+        router,
+        tokens: daemon.tokens.clone(),
     };
-
-    // Start the probe daemon.
-    let daemon = daemon::Daemon::new(client, router.clone(), cfg.clone());
-    let stop = daemon.stop.clone();
-    tokio::spawn(async move { daemon.run().await });
-
-    // Do an initial probe before serving so the first request is already routed well.
-    {
-        let d = daemon::Daemon::new(reqwest::Client::new(), router.clone(), cfg.clone());
-        d.probe_once().await;
-    }
-
     let app = proxy::build_router(state);
     use std::str::FromStr;
     let addr = std::net::SocketAddr::from_str(&format!("{}:{}", cfg.bind, cfg.port))
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port)));
     tracing::info!(%addr, "mirror-rs proxy listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let server = axum::serve(listener, app);
-
-    // Graceful shutdown on SIGINT/SIGTERM.
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        #[cfg(unix)]
-        {
-            let mut sig =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! {
-                _ = sig.recv() => {}
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::select! {
-        r = server => { r?; }
-        _ = shutdown => {
-            tracing::info!("shutting down");
-            *stop.write().await = true;
-        }
-    }
+    let probe_task = tokio::spawn(daemon.run());
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    probe_task.abort();
+    result?;
     Ok(())
+}
+
+fn proxy_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(32)
+        .build()
+}
+
+async fn shutdown_signal() {
+    let interrupt = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install SIGINT handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutting down");
 }
 
 // ---------- setup / teardown ----------
@@ -230,7 +234,7 @@ async fn setup(cfg: &Config, do_restart: bool) -> anyhow::Result<()> {
     install_launchd(cfg, &proxy_url)?;
 
     // 3. Start the proxy now (if not already running) so the restart has it up.
-    ensure_proxy_running(cfg)?;
+    ensure_proxy_running(cfg).await?;
 
     // 4. Restart docker to pick up the new registry-mirrors.
     if do_restart {
@@ -399,12 +403,14 @@ fn remove_launchd(cfg: &Config) -> anyhow::Result<()> {
 }
 
 /// Start the proxy in the background if it isn't already listening.
-fn ensure_proxy_running(cfg: &Config) -> anyhow::Result<()> {
+async fn ensure_proxy_running(cfg: &Config) -> anyhow::Result<()> {
     let base = format!("http://127.0.0.1:{}/healthz", cfg.port);
-    let client = reqwest::blocking::Client::new();
+    let client = proxy_client()?;
     if client
         .get(&base)
+        .timeout(std::time::Duration::from_secs(2))
         .send()
+        .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
     {
@@ -412,10 +418,12 @@ fn ensure_proxy_running(cfg: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
     // launchd should have started it; give it a moment.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let ok = client
         .get(&base)
+        .timeout(std::time::Duration::from_secs(2))
         .send()
+        .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
     if !ok {
@@ -477,4 +485,29 @@ fn which(bin: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setup_health_check_runs_inside_async_runtime() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = Config {
+            port: listener.local_addr().unwrap().port(),
+            ..Config::default()
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })),
+            )
+            .await
+            .unwrap();
+        });
+        let result = ensure_proxy_running(&cfg).await;
+        server.abort();
+        result.unwrap();
+    }
 }

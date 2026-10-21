@@ -1,117 +1,96 @@
 # mirror-rs
 
-Seamless, transparent Docker registry mirror proxy with **speed-based load
-balancing** — written in Rust.
+用 Rust 编写的 Docker 镜像加速代理。定期测试镜像站的响应速度和下载速度，优先使用得分最好的镜像站，失败时尝试其他站点。
 
-## Why a proxy (and not just `registry-mirrors`)?
+配置完成后，照常使用 `docker pull`，无需修改镜像名称。镜像站排名变化时不需要重启 Docker。
 
-Docker's `registry-mirrors` is a **fallback list**, not a load balancer: the
-daemon tries them in order and only moves to the next one after the previous
-fails. It never picks the fastest. So a "seamless auto-load" tool can't just
-rewrite the config — it has to hijack at the **registry-protocol layer**.
+## 安装
 
-`mirror-rs` does exactly that:
+支持 macOS 和 Linux，提供 arm64 / x86_64 预编译二进制，无需安装 Rust。
 
-```
-docker pull nginx
-   │  (daemon's registry-mirrors = http://host.docker.internal:7788)
-   ▼
-┌─────────────────────────────────────────────┐
-│  mirror-rs  (local proxy, 0.0.0.0:7788)     │
-│                                             │
-│  1. per-request: route to the FASTEST mirror│
-│  2. on error:  fail over to the next        │
-│  3. 401:       do the registry token dance  │
-│  4. every 5min: re-probe all mirrors        │
-│     (TTFB + real blob throughput)           │
-│     and re-rank — NO docker restart needed  │
-└─────────────────────────────────────────────┘
-   │            │              │
-   ▼            ▼              ▼
- daocloud    1ms.run     xuanyuan.me   (upstream mirrors)
-```
-
-Because the routing decision happens **per request inside the proxy**, the
-daemon never needs to restart when speeds change — that's what makes it
-"无感" (seamless). The only restart is the one-time `setup`.
-
-## Features
-
-- **Speed-based routing** — probes each mirror's TTFB *and* real blob
-  throughput (downloads a 256KB slice of an actual layer, not just a ping).
-- **Transparent failover** — if the best mirror dies mid-pull, the next one
-  takes over automatically.
-- **Token auth** — handles the Docker registry `WWW-Authenticate` Bearer dance
-  (401 → fetch token → retry) for both manifests and blobs.
-- **OCI index resolution** — correctly resolves multi-arch image indexes to a
-  platform manifest (linux/amd64|arm64) so probes measure real layers.
-- **Auto-start** — installs a macOS launchd agent (`KeepAlive`), so the proxy
-  survives reboots and crashes.
-- **Safe config management** — backs up `docker.json` before editing, preserves
-  other keys (e.g. `ipv6`), and `teardown` restores cleanly.
-
-## Install
-
-### Homebrew (macOS / Linux)
+### Homebrew
 
 ```bash
 brew install pengyanai/tap/mirror-rs
 ```
 
-### pip (any platform with a prebuilt binary)
+### pip
+
+从 GitHub 安装指定版本，构建时会下载对应平台的 Release 二进制：
 
 ```bash
-pip install git+https://github.com/pengyanai/mirror-rs
+pip install "git+https://github.com/pengyanai/mirror-rs.git@v0.1.1"
 ```
 
-The wheel bundles the prebuilt binary for your platform (macOS arm64/x86_64,
-Linux x86_64/aarch64) — no Rust toolchain needed.
+尚未发布到 PyPI，暂不支持直接运行 `pip install mirror-rs`。需要 Git，并能访问 GitHub Release。建议在 virtualenv 中安装，也可以使用 `pipx`。
 
-### From source
+### 从源码构建
 
 ```bash
-cargo build --release
-# binary: target/release/mirror-rs
+git clone https://github.com/pengyanai/mirror-rs.git
+cd mirror-rs
+cargo build --locked --release
+./target/release/mirror-rs --version
 ```
 
-## Setup (one-time)
+## 开始使用
+
+macOS + OrbStack 可以使用自动配置。先生成配置文件：
 
 ```bash
-# 1. (optional) edit config: mirrors, port, probe interval
-~/.config/mirror-rs/config.json        # created on first run, or:
-mirror-rs init                          # print default config
+mkdir -p ~/.config/mirror-rs
+mirror-rs init > ~/.config/mirror-rs/config.json
+```
 
-# 2. install: writes docker config + launchd agent + restarts docker
+然后执行：
+
+```bash
 mirror-rs setup
+mirror-rs status
+docker pull alpine
 ```
 
-`setup` does:
-1. Backs up `~/.orbstack/config/docker.json` (OrbStack) or
-   `~/.docker/daemon.json`.
-2. Sets `registry-mirrors` to `http://host.docker.internal:7788` (the host
-   address as seen from the Docker daemon inside the OrbStack VM — `127.0.0.1`
-   would be the VM's own loopback and won't work).
-3. Installs `~/Library/LaunchAgents/com.mirror-rs.plist` (auto-start + KeepAlive).
-4. Restarts Docker (`orb restart -a` on OrbStack, `systemctl restart docker`
-   elsewhere).
-
-## Usage
+`setup` 会备份并修改 Docker 配置、安装 macOS launchd 服务，并重启 Docker。容器会有短暂中断。若要稍后自行重启：
 
 ```bash
-mirror-rs probe      # one-shot speed test, ranked table
-mirror-rs status     # current mirror ranking (live)
-mirror-rs run        # run the proxy in the foreground (debugging)
-mirror-rs teardown   # remove: restore docker config + uninstall launchd
+mirror-rs setup --no-restart
 ```
 
-The proxy also exposes:
-- `GET /healthz` — liveness
-- `GET /__mirror__/status` — current ranking (JSON)
-- `GET /__mirror__/probe` — trigger an immediate re-probe
+Linux 支持运行代理，需要自行配置 Docker 和 systemd；当前 `setup` 的自动服务管理仅支持 macOS。Linux 原生 Docker 通常在 `/etc/docker/daemon.json` 配置：
 
-## Config
+```json
+{
+  "registry-mirrors": ["http://127.0.0.1:7788"]
+}
+```
 
-`~/.config/mirror-rs/config.json`:
+合并到已有配置后重启 Docker，并自行保持 `mirror-rs run` 常驻。Docker Desktop 等其他环境需要确认 Docker daemon 能访问宿主机地址。
+
+## 常用命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `mirror-rs probe` | 测试所有镜像站并输出排名 |
+| `mirror-rs status` | 查看运行中代理的排名 |
+| `mirror-rs run` | 在前台运行代理 |
+| `mirror-rs init` | 输出默认配置 |
+| `mirror-rs teardown` | 移除 macOS 服务及代理配置，并重启 Docker |
+
+卸载前先运行 `mirror-rs teardown`，再用对应包管理器卸载：
+
+```bash
+brew uninstall mirror-rs
+```
+
+或：
+
+```bash
+pip uninstall mirror-rs
+```
+
+## 配置
+
+默认读取 `~/.config/mirror-rs/config.json`，可用 `--config` 指定其他路径。最小示例：
 
 ```json
 {
@@ -129,34 +108,31 @@ The proxy also exposes:
 }
 ```
 
-- `bind` — must be `0.0.0.0` so the OrbStack VM can reach the host proxy.
-- `host_ip` — what gets written into `registry-mirrors`. On OrbStack use
-  `host.docker.internal`. On a Linux host running Docker natively, use
-  `127.0.0.1`.
-- `mirrors` — your candidate list. Order is the *initial* preference; the
-  probe re-ranks by measured speed.
+- `host_ip`：写入 Docker 配置的宿主机地址。OrbStack 使用 `host.docker.internal`；Linux 原生 Docker 通常使用 `127.0.0.1`。
+- `bind`：OrbStack 需要访问宿主机代理，使用 `0.0.0.0`；仅供本机访问时可使用 `127.0.0.1`。
+- `mirrors`：候选镜像站，按实测结果动态排序。第三方站点的可用性可能变化。
+- `probe_interval_secs`：探测间隔，默认 300 秒。
+- `probe_bytes`：每次测速的 layer 采样大小，默认 256 KiB。
+- `docker_config_path`：可选，自定义 `setup` 修改的 Docker 配置路径。
 
-## Scoring
+提供三个 HTTP 接口：`GET /healthz`、`GET /__mirror__/status`、`GET /__mirror__/probe`。
 
-`score = ttfb_ms + throughput_penalty`, where
-`throughput_penalty = 100 / (MB/s)` (capped at 5000 if < 0.05 MB/s). Lower is
-better. This weights latency heavily while still rewarding real download
-speed, so a low-latency-but-slow mirror ranks below a balanced one.
+## 工作方式
 
-## Verified (2026-10-20, OrbStack 2.2.4 / Docker 29.8.2 / macOS arm64)
+Docker 的 `registry-mirrors` 按顺序回退。mirror-rs 作为固定入口，在代理内部根据测速结果选择上游，通过流式转发下载 layer，并处理 Registry Bearer token 认证。
 
-- `docker pull hello-world` — every request (ping, manifest, blobs) served by
-  the proxy, all routed to the fastest mirror (`docker.m.daocloud.io`).
-- `docker pull nginx` (~140MB) — 16.4s ≈ 8.5 MB/s sustained through the proxy.
-- Failover — with the #1 mirror dead, requests transparently fall back.
-- Containers with `unless-stopped` restart policy auto-recover from the
-  one-time `orb restart` (3.7s).
+评分同时考虑响应耗时和采样吞吐，分数越低越优先。该排名是网络采样结果，不保证每个镜像、每次请求都达到最高吞吐。传输中断后由 Docker 客户端重试，不会在同一响应流中切换上游。
 
-## Notes / limitations
+主要使用 Axum、Tokio 和 reqwest，复用 HTTP 连接池和流式响应 API。实现取舍、验证范围见 [docs/DESIGN.md](docs/DESIGN.md)。
 
-- The one-time `setup` restarts Docker (brief interruption). After that, speed
-  changes are handled live with **no** restart.
-- Mirrors that return 404 for a manifest (e.g. `dockerproxy.net`) are treated
-  as dead and excluded.
-- The proxy binds `0.0.0.0` on the host — it's a local registry proxy, not a
-  public service. Don't expose the port to the internet.
+代理用于 Docker Hub 镜像拉取；不提供 push、镜像内容缓存或访问控制。默认监听所有网卡，部署时请限制可访问范围。
+
+## 开发与发布
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked --release
+```
+
+推送 `v*` 标签后，GitHub Actions 构建四个平台的二进制，上传 GitHub Release，并在配置 `TAP_TOKEN` 后自动更新 `pengyanai/homebrew-tap`。

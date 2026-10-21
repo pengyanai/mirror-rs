@@ -13,6 +13,7 @@ pub struct Router {
     pub mirrors: Arc<Vec<Mirror>>,
     /// Latest probe results, keyed by mirror index.
     pub results: Arc<RwLock<Vec<ProbeResult>>>,
+    cooldowns: moka::future::Cache<String, ()>,
 }
 
 impl Router {
@@ -23,13 +24,33 @@ impl Router {
             order: Arc::new(RwLock::new(order)),
             mirrors: Arc::new(mirrors),
             results: Arc::new(RwLock::new(Vec::new())),
+            cooldowns: moka::future::Cache::builder()
+                .max_capacity(n.max(1) as u64)
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
         }
     }
 
     /// Return mirrors in current preference order (best first).
     pub async fn ordered_mirrors(&self) -> Vec<Mirror> {
-        let order = self.order.read().await;
-        order.iter().map(|&i| self.mirrors[i].clone()).collect()
+        let order = self.order.read().await.clone();
+        let mut ready = Vec::new();
+        let mut cooled = Vec::new();
+        for i in order {
+            let mirror = self.mirrors[i].clone();
+            if self.cooldowns.get(&mirror.url).await.is_some() {
+                cooled.push(mirror);
+            } else {
+                ready.push(mirror);
+            }
+        }
+        // Keep cooled mirrors as a last resort when every upstream is failing.
+        ready.extend(cooled);
+        ready
+    }
+
+    pub async fn cool_down(&self, mirror: &Mirror) {
+        self.cooldowns.insert(mirror.url.clone(), ()).await;
     }
 
     /// Update the ordering from fresh probe results.

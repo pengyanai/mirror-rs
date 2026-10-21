@@ -31,6 +31,18 @@ class Response(io.BytesIO):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_supported_platforms_select_matching_release_asset(self):
+        for system, machine, expected in (
+            ("darwin", "arm64", "aarch64-apple-darwin"),
+            ("darwin", "x86_64", "x86_64-apple-darwin"),
+            ("linux", "aarch64", "aarch64-unknown-linux-musl"),
+            ("linux", "x86_64", "x86_64-unknown-linux-musl"),
+        ):
+            with self.subTest(system=system, machine=machine), patch.object(
+                sys, "platform", system
+            ), patch.object(backend.platform, "machine", return_value=machine):
+                self.assertEqual(backend._target_name(), expected)
+
     def test_unsupported_architecture_is_rejected(self):
         with patch.object(sys, "platform", "linux"), patch.object(
             backend.platform, "machine", return_value="ppc64le"
