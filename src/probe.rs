@@ -72,7 +72,10 @@ pub async fn probe_mirror(
     let digest = manifest
         .get("layers")
         .and_then(|l| l.as_array())
-        .and_then(|arr| arr.iter().max_by_key(|x| x.get("size").and_then(|s| s.as_u64()).unwrap_or(0)))
+        .and_then(|arr| {
+            arr.iter()
+                .max_by_key(|x| x.get("size").and_then(|s| s.as_u64()).unwrap_or(0))
+        })
         .and_then(|l| l.get("digest"))
         .and_then(|d| d.as_str())
         .map(|s| s.to_string());
@@ -124,7 +127,10 @@ async fn fetch_manifest(
 
     // If it's an index (has "manifests", no "layers"), resolve a platform child.
     if manifest.get("layers").is_none()
-        && manifest.get("manifests").and_then(|m| m.as_array()).is_some()
+        && manifest
+            .get("manifests")
+            .and_then(|m| m.as_array())
+            .is_some()
     {
         let base = url
             .rsplit_once("/manifests/")
@@ -161,7 +167,11 @@ fn pick_platform_manifest(index: &serde_json::Value) -> Option<String> {
             best = Some(m);
         }
     }
-    best.and_then(|m| m.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
+    best.and_then(|m| {
+        m.get("digest")
+            .and_then(|d| d.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 /// GET a JSON resource with the token dance.
@@ -211,10 +221,10 @@ async fn fetch_blob_sample(
     probe_bytes: u64,
     timeout: Duration,
 ) -> Result<(u64, u64), String> {
-    let mut req = client
-        .get(url)
-        .timeout(timeout)
-        .header("Range", format!("bytes=0-{}", probe_bytes.saturating_sub(1)));
+    let mut req = client.get(url).timeout(timeout).header(
+        "Range",
+        format!("bytes=0-{}", probe_bytes.saturating_sub(1)),
+    );
     if let Some(tok) = &mirror.token {
         req = req.header("Authorization", format!("Bearer {tok}"));
     }
@@ -232,7 +242,10 @@ async fn fetch_blob_sample(
         let resp2 = client
             .get(url)
             .timeout(timeout)
-            .header("Range", format!("bytes=0-{}", probe_bytes.saturating_sub(1)))
+            .header(
+                "Range",
+                format!("bytes=0-{}", probe_bytes.saturating_sub(1)),
+            )
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
@@ -249,7 +262,10 @@ async fn fetch_blob_sample(
 }
 
 /// Stream up to `probe_bytes` and return (throughput_bps, bytes_downloaded).
-async fn stream_throughput(resp: reqwest::Response, probe_bytes: u64) -> Result<(u64, u64), String> {
+async fn stream_throughput(
+    resp: reqwest::Response,
+    probe_bytes: u64,
+) -> Result<(u64, u64), String> {
     use futures_util::StreamExt;
     let mut stream = resp.bytes_stream();
     let mut bytes_downloaded: u64 = 0;
@@ -280,7 +296,11 @@ pub async fn probe_all(
         async move { probe_mirror(client, m, probe_bytes, timeout_ms).await }
     });
     let mut results = futures_util::future::join_all(futs).await;
-    results.sort_by(|a, b| a.score().partial_cmp(&b.score()).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        a.score()
+            .partial_cmp(&b.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 

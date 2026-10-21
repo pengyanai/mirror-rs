@@ -29,10 +29,7 @@ impl Router {
     /// Return mirrors in current preference order (best first).
     pub async fn ordered_mirrors(&self) -> Vec<Mirror> {
         let order = self.order.read().await;
-        order
-            .iter()
-            .map(|&i| self.mirrors[i].clone())
-            .collect()
+        order.iter().map(|&i| self.mirrors[i].clone()).collect()
     }
 
     /// Update the ordering from fresh probe results.
@@ -44,15 +41,18 @@ impl Router {
             .enumerate()
             .map(|(i, m)| (m.url.as_str(), i))
             .collect();
-        let mut new_results = vec![ProbeResult {
-            url: String::new(),
-            ttfb_ms: 0,
-            throughput_bps: 0,
-            bytes_downloaded: 0,
-            ok: false,
-            error: Some("not probed".into()),
-            probed_at_ms: 0,
-        }; self.mirrors.len()];
+        let mut new_results = vec![
+            ProbeResult {
+                url: String::new(),
+                ttfb_ms: 0,
+                throughput_bps: 0,
+                bytes_downloaded: 0,
+                ok: false,
+                error: Some("not probed".into()),
+                probed_at_ms: 0,
+            };
+            self.mirrors.len()
+        ];
         let mut order: Vec<usize> = Vec::new();
         for r in &results {
             if let Some(&idx) = url_to_idx.get(r.url.as_str()) {

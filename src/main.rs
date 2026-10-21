@@ -9,10 +9,19 @@ use config::Config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "mirror-rs", version, about = "Seamless Docker registry mirror proxy with speed-based load balancing")]
+#[command(
+    name = "mirror-rs",
+    version,
+    about = "Seamless Docker registry mirror proxy with speed-based load balancing"
+)]
 struct Cli {
     /// Path to config file.
-    #[arg(short, long, global = true, default_value = "~/.config/mirror-rs/config.json")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "~/.config/mirror-rs/config.json"
+    )]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -78,7 +87,9 @@ async fn main() -> anyhow::Result<()> {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_millis(cfg.probe_timeout_ms))
                 .build()?;
-            let results = probe::probe_all(&client, &cfg.mirrors, cfg.probe_bytes, cfg.probe_timeout_ms).await;
+            let results =
+                probe::probe_all(&client, &cfg.mirrors, cfg.probe_bytes, cfg.probe_timeout_ms)
+                    .await;
             print_table(&results);
             Ok(())
         }
@@ -148,7 +159,9 @@ fn truncate(s: &str, n: usize) -> String {
 
 async fn run_server(cfg: &Config) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(cfg.probe_timeout_ms.max(30_000)))
+        .timeout(std::time::Duration::from_millis(
+            cfg.probe_timeout_ms.max(30_000),
+        ))
         .pool_max_idle_per_host(32)
         .build()?;
 
@@ -165,11 +178,7 @@ async fn run_server(cfg: &Config) -> anyhow::Result<()> {
 
     // Do an initial probe before serving so the first request is already routed well.
     {
-        let d = daemon::Daemon::new(
-            reqwest::Client::new(),
-            router.clone(),
-            cfg.clone(),
-        );
+        let d = daemon::Daemon::new(reqwest::Client::new(), router.clone(), cfg.clone());
         d.probe_once().await;
     }
 
@@ -186,7 +195,8 @@ async fn run_server(cfg: &Config) -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         #[cfg(unix)]
         {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut sig =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             tokio::select! {
                 _ = sig.recv() => {}
             }
@@ -279,7 +289,10 @@ fn remove_docker_mirror(path: &PathBuf, proxy_url: &str) -> anyhow::Result<()> {
     }
     let raw = std::fs::read_to_string(path)?;
     let mut val: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
-    if let Some(arr) = val.get_mut("registry-mirrors").and_then(|v| v.as_array_mut()) {
+    if let Some(arr) = val
+        .get_mut("registry-mirrors")
+        .and_then(|v| v.as_array_mut())
+    {
         arr.retain(|m| m.as_str() != Some(proxy_url));
         if arr.is_empty() {
             val.as_object_mut().unwrap().remove("registry-mirrors");
@@ -296,14 +309,16 @@ fn install_launchd(cfg: &Config, proxy_url: &str) -> anyhow::Result<()> {
     {
         let bin = std::env::current_exe()?;
         let config_path = cfg.resolved_config_path();
-        let plist_path = cfg
-            .launchd_plist_path
-            .clone()
-            .unwrap_or_else(|| dirs::home_dir().unwrap().join("Library/LaunchAgents/com.mirror-rs.plist"));
-        let log_path = cfg
-            .log_path
-            .clone()
-            .unwrap_or_else(|| dirs::home_dir().unwrap().join(".config/mirror-rs/mirror-rs.log"));
+        let plist_path = cfg.launchd_plist_path.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap()
+                .join("Library/LaunchAgents/com.mirror-rs.plist")
+        });
+        let log_path = cfg.log_path.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap()
+                .join(".config/mirror-rs/mirror-rs.log")
+        });
         if let Some(parent) = plist_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -342,7 +357,10 @@ fn install_launchd(cfg: &Config, proxy_url: &str) -> anyhow::Result<()> {
             .args(["load", plist_path.to_str().unwrap()])
             .output()?;
         if !out.status.success() {
-            tracing::warn!(stderr = String::from_utf8_lossy(&out.stderr).to_string(), "launchctl load");
+            tracing::warn!(
+                stderr = String::from_utf8_lossy(&out.stderr).to_string(),
+                "launchctl load"
+            );
         }
         tracing::info!(plist = %plist_path.display(), "installed launchd agent");
         let _ = proxy_url;
@@ -359,10 +377,11 @@ fn install_launchd(cfg: &Config, proxy_url: &str) -> anyhow::Result<()> {
 fn remove_launchd(cfg: &Config) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let plist_path = cfg
-            .launchd_plist_path
-            .clone()
-            .unwrap_or_else(|| dirs::home_dir().unwrap().join("Library/LaunchAgents/com.mirror-rs.plist"));
+        let plist_path = cfg.launchd_plist_path.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap()
+                .join("Library/LaunchAgents/com.mirror-rs.plist")
+        });
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")
                 .args(["unload", plist_path.to_str().unwrap()])
@@ -383,13 +402,22 @@ fn remove_launchd(cfg: &Config) -> anyhow::Result<()> {
 fn ensure_proxy_running(cfg: &Config) -> anyhow::Result<()> {
     let base = format!("http://127.0.0.1:{}/healthz", cfg.port);
     let client = reqwest::blocking::Client::new();
-    if client.get(&base).send().map(|r| r.status().is_success()).unwrap_or(false) {
+    if client
+        .get(&base)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+    {
         tracing::info!("proxy already running");
         return Ok(());
     }
     // launchd should have started it; give it a moment.
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let ok = client.get(&base).send().map(|r| r.status().is_success()).unwrap_or(false);
+    let ok = client
+        .get(&base)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
     if !ok {
         tracing::warn!("proxy not responding yet; launchd will (re)start it. You may need to run `mirror-rs run` manually.");
     }
@@ -401,9 +429,14 @@ fn restart_docker() -> anyhow::Result<()> {
     let orb = which("orb");
     if orb.is_some() {
         tracing::info!("restarting docker via `orb restart -a`");
-        let out = std::process::Command::new("orb").args(["restart", "-a"]).output()?;
+        let out = std::process::Command::new("orb")
+            .args(["restart", "-a"])
+            .output()?;
         if !out.status.success() {
-            anyhow::bail!("orb restart -a failed: {}", String::from_utf8_lossy(&out.stderr));
+            anyhow::bail!(
+                "orb restart -a failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     } else {
         tracing::info!("restarting docker via systemctl");
@@ -411,7 +444,10 @@ fn restart_docker() -> anyhow::Result<()> {
             .args(["systemctl", "restart", "docker"])
             .output()?;
         if !out.status.success() {
-            anyhow::bail!("systemctl restart docker failed: {}", String::from_utf8_lossy(&out.stderr));
+            anyhow::bail!(
+                "systemctl restart docker failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
     // Wait for docker to come back.

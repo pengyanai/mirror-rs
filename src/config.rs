@@ -53,12 +53,24 @@ pub struct Config {
     pub probe_timeout_ms: u64,
 }
 
-fn default_port() -> u16 { 7788 }
-fn default_bind() -> String { "0.0.0.0".to_string() }
-fn default_host_ip() -> String { "host.docker.internal".to_string() }
-fn default_probe_interval() -> u64 { 300 }
-fn default_probe_bytes() -> u64 { 256 * 1024 }
-fn default_probe_timeout_ms() -> u64 { 8000 }
+fn default_port() -> u16 {
+    7788
+}
+fn default_bind() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_host_ip() -> String {
+    "host.docker.internal".to_string()
+}
+fn default_probe_interval() -> u64 {
+    300
+}
+fn default_probe_bytes() -> u64 {
+    256 * 1024
+}
+fn default_probe_timeout_ms() -> u64 {
+    8000
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -88,7 +100,10 @@ pub fn default_mirrors() -> Vec<Mirror> {
         "https://hub.rat.dev",
     ]
     .iter()
-    .map(|u| Mirror { url: u.to_string(), token: None })
+    .map(|u| Mirror {
+        url: u.to_string(),
+        token: None,
+    })
     .collect()
 }
 

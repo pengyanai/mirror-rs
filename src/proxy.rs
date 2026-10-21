@@ -75,20 +75,16 @@ async fn status(State(state): State<AppState>) -> Response {
             })
         })
         .collect();
-    (StatusCode::OK, axum::Json(serde_json::json!({ "order": payload }))).into_response()
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "order": payload })),
+    )
+        .into_response()
 }
 
-async fn probe_now(
-    State(state): State<AppState>,
-) -> Response {
+async fn probe_now(State(state): State<AppState>) -> Response {
     let mirrors = state.router.mirrors.clone();
-    let results = crate::probe::probe_all(
-        &state.client,
-        &mirrors,
-        256 * 1024,
-        8000,
-    )
-    .await;
+    let results = crate::probe::probe_all(&state.client, &mirrors, 256 * 1024, 8000).await;
     state.router.update_from_probes(results.clone()).await;
     let payload: Vec<serde_json::Value> = results
         .iter()
@@ -104,7 +100,11 @@ async fn probe_now(
             })
         })
         .collect();
-    (StatusCode::OK, axum::Json(serde_json::json!({ "results": payload }))).into_response()
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "results": payload })),
+    )
+        .into_response()
 }
 
 /// The transparent proxy handler: route to the best mirror, fail over on error.
@@ -163,7 +163,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
 
     // All mirrors failed.
     let is_404 = last_err.as_ref().map(|e| e.is_404()).unwrap_or(false);
-    let msg = last_err.map(|e| e.describe()).unwrap_or_else(|| "no mirrors configured".into());
+    let msg = last_err
+        .map(|e| e.describe())
+        .unwrap_or_else(|| "no mirrors configured".into());
     let status = if all_404 && is_404 {
         StatusCode::NOT_FOUND
     } else {
@@ -190,7 +192,11 @@ async fn forward_once(
 
     // 401 => perform the registry token dance and retry once.
     if status.as_u16() == 401 {
-        if let Some(wa) = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()) {
+        if let Some(wa) = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Some(token) = crate::probe::fetch_token(client, wa).await {
                 let mut h2 = headers.clone();
                 h2.insert("Authorization", format!("Bearer {token}").parse().unwrap());
