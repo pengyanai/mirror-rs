@@ -41,3 +41,13 @@ jobs:
         run: |
           ./target/release/mirror-rs init > /dev/null
           ./target/release/mirror-rs --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python packaging regression tests
+        run: |
+          python -m pip install 'setuptools>=70.1' build
+          python -I tests/test_packaging.py
+          python -m build --sdist

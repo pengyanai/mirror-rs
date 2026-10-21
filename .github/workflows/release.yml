@@ -21,7 +21,7 @@ jobs:
             target: aarch64-apple-darwin
             name: aarch64-apple-darwin
             cross: false
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: x86_64-apple-darwin
             cross: false
@@ -45,17 +45,23 @@ jobs:
 
       - name: Install cross
         if: matrix.cross == true
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cross-rs/cross/master/install.sh | sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Build (native)
         if: matrix.cross == false
-        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.cross == true
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
@@ -65,7 +71,7 @@ jobs:
           chmod +x "$BIN"
           pkg="mirror-rs-${{ matrix.name }}"
           tar -czf "${pkg}.tar.gz" -C target/${{ matrix.target }}/release mirror-rs
-          sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+          shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,12 +94,44 @@ jobs:
           path: dist
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s globstar
+          gh release create "$GITHUB_REF_NAME" dist/**/*.tar.gz dist/**/*.sha256 \
+            --verify-tag --generate-notes
+
+  python-package:
+    name: Python package (${{ matrix.os }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          files: |
-            dist/**/*.tar.gz
-            dist/**/*.sha256
-          generate_release_notes: true
+          python-version: '3.12'
+
+      - name: Build and smoke test wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python -m pip install dist/*.whl
+          mirror-rs --version
+          mirror-rs init > /dev/null
+
+      - name: Build source distribution
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m build --sdist
+
+      - name: Upload Python packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/*
 
   update-brew:
     name: Update Homebrew formula
@@ -101,14 +139,24 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-    if: ${{ env.TAP_TOKEN != '' }}
     steps:
+      - name: Check tap credentials
+        id: credentials
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Homebrew update skipped: TAP_TOKEN is not configured" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Checkout mirror-rs (for script)
+        if: steps.credentials.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           path: mirror-rs
 
       - name: Checkout tap repo
+        if: steps.credentials.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           repository: pengyanai/homebrew-tap
@@ -116,8 +164,11 @@ jobs:
           token: ${{ secrets.TAP_TOKEN }}
 
       - name: Generate + commit formula
+        if: steps.credentials.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 mirror-rs/scripts/gen_brew_formula.py "" tap/Formula/mirror-rs.rb
+          python3 mirror-rs/scripts/gen_brew_formula.py "$GITHUB_REF_NAME" tap/Formula/mirror-rs.rb
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

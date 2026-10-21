@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=70.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirror-rs"
-version = "0.1.0"
+version = "0.1.1"
 description = "Seamless, transparent Docker registry mirror proxy with speed-based load balancing"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -33,4 +33,5 @@ packages = ["mirror_rs"]
 mirror_rs = ["bin/*"]
 
 [tool.setuptools.cmdclass]
-build_py = "build_backend:BuildPy"
+build_py = "build_backend.BuildPy"
+bdist_wheel = "build_backend.BDistWheel"

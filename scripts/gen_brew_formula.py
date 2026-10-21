@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate a Homebrew formula for mirror-rs from a GitHub release.
 
-Reads the release (public API, no token needed) and writes a formula that
-selects the right prebuilt binary per platform/arch.
+Uses gh CLI to read release checksums and select prebuilt binaries per platform.
 
 Usage:
     gen_brew_formula.py [tag] [out_path]
@@ -13,21 +12,15 @@ Usage:
 import json
 import os
 import sys
-import urllib.request
+import subprocess
+import tempfile
+from pathlib import Path
 
 REPO = "pengyanai/mirror-rs"
 
 
-def fetch(url: str) -> bytes:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "mirror-rs-brew-updater"}
-    )
-    with urllib.request.urlopen(req) as r:
-        return r.read()
-
-
-def fetch_json(url: str):
-    return json.loads(fetch(url))
+def fetch_json(endpoint: str):
+    return json.loads(subprocess.check_output(["gh", "api", endpoint]))
 
 
 def main() -> None:
@@ -35,16 +28,26 @@ def main() -> None:
     out = sys.argv[2] if len(sys.argv) > 2 else "Formula/mirror-rs.rb"
 
     if not tag:
-        tag = fetch_json(f"https://api.github.com/repos/{REPO}/releases/latest")["tag_name"]
+        tag = fetch_json(f"repos/{REPO}/releases/latest")["tag_name"]
     version = tag.lstrip("v")
     base = f"https://github.com/{REPO}/releases/download/{tag}"
 
-    rel = fetch_json(f"https://api.github.com/repos/{REPO}/releases/tags/{tag}")
-    assets = {a["name"]: a["browser_download_url"] for a in rel["assets"]}
+    with tempfile.TemporaryDirectory() as directory:
+        subprocess.run(
+            ["gh", "release", "download", tag, "--repo", REPO,
+             "--pattern", "*.tar.gz.sha256", "--dir", directory],
+            check=True,
+        )
+        checksums = {
+            path.name: path.read_text().split()[0]
+            for path in Path(directory).glob("*.tar.gz.sha256")
+        }
 
     def sha256(pkg: str) -> str:
-        data = fetch(assets[f"{pkg}.tar.gz.sha256"]).decode()
-        return data.split()[0]
+        digest = checksums[f"{pkg}.tar.gz.sha256"]
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(f"Invalid SHA256 for {pkg}")
+        return digest
 
     targets = {
         "aarch64-apple-darwin": sha256("mirror-rs-aarch64-apple-darwin"),
