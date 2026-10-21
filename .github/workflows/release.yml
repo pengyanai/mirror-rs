@@ -98,7 +98,9 @@ jobs:
     name: Update Homebrew formula
     needs: release
     runs-on: ubuntu-latest
-    if: ${{ secrets.TAP_TOKEN != '' }}
+    env:
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+    if: ${{ env.TAP_TOKEN != '' }}
     steps:
       - name: Checkout mirror-rs (for script)
         uses: actions/checkout@v4
